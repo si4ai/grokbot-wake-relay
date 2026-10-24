@@ -166,7 +166,80 @@ fake bot saw 2 forwards (5 events):
   wake 2: events=['evt-1', 'evt-2', 'evt-3', 'evt-4'] pending_count=4 last_note="handled evt-0"
 ```
 
-## 4. Limits, and what the platform should ship natively
+## 4. Reproduce it yourself
+
+About 20 minutes. You need bash, curl and Python 3.10+ on the machine your bot's shell runs on.
+
+**1. Make a throwaway routine.** In Grok Bot, create a routine with a webhook trigger.
+Copy its webhook URL and key from the routine's details straight into owner-only files.
+Never paste the key into a chat or commit it.
+
+```sh
+umask 077; mkdir -p ~/relay-test && cd ~/relay-test
+cat > bot-webhook.url      # paste the URL, Enter, Ctrl-D
+cat > bot-webhook.key      # paste the key without "Bearer ", Enter, Ctrl-D
+python3 -c 'import secrets; print(secrets.token_urlsafe(36))' > inbound.secret
+echo http://127.0.0.1:8787/event > relay-event.url
+chmod 600 ./*
+auth() { printf 'Authorization: Bearer %s\n' "$(cat "$1")"; }  # keeps keys off the command line
+```
+
+Give the routine a prompt like this one (swap in your own folder):
+
+> On each wake, append one line to `~/relay-test/live.log`:
+> `wake <time> run_id=<run_id> pending_count=<n> events=<ids> last_note=<last_note>`.
+> Stay busy for about 60 s. Then POST `{"run_id": "<run_id>", "note": "handled <ids>"}` to
+> `http://127.0.0.1:8787/done` with `Authorization: Bearer <contents of ~/relay-test/inbound.secret>`,
+> and append `done <time> <status> <response>` to the same log. Never print the secret.
+> Send nothing to anyone.
+
+**2. See the problem.** Send a burst straight to the webhook:
+
+```sh
+for i in 1 2 3 4 5; do
+  curl -s -X POST "$(cat bot-webhook.url)" -H @<(auth bot-webhook.key) \
+    -H 'Content-Type: application/json' -d "{\"id\":\"direct-$i\"}"; sleep 1
+done
+```
+
+You get 5 separate cold runs and 5 `wake` lines, each with no idea the others happened.
+Their `/done` calls fail, because no relay is running yet. Whether webhook runs overlap
+is unconfirmed; scheduled runs were seen to serialize.
+
+For the silent job, ask the bot in a run to start `(sleep 120; echo finished > ~/relay-test/job.txt) &`
+and end its turn. `job.txt` appears two minutes later, and nobody is woken.
+
+**3. Apply the fix.** Start the relay, then send the same burst to it instead:
+
+```sh
+RELAY_STATE=$PWD/state.json RELAY_DOWNSTREAM_URL_FILE=$PWD/bot-webhook.url \
+RELAY_DOWNSTREAM_KEY_FILE=$PWD/bot-webhook.key RELAY_INBOUND_SECRET_FILE=$PWD/inbound.secret \
+  nohup python3 /path/to/relay.py > relay.out 2>&1 &
+for i in 1 2 3 4 5; do
+  curl -s -X POST "$(cat relay-event.url)" -H @<(auth inbound.secret) \
+    -H 'Content-Type: application/json' -d "{\"id\":\"evt-$i\"}"; echo; sleep 1
+done
+```
+
+Expect `forwarded` and then 4 × `queued`. In our run against a live routine, 5 events became
+2 wakes. The first wake came 6 s after the first event, with `pending_count=0`. About 70 s
+later, run 1's `/done` got `forwarded batch, count 4`. The second wake came 6 s after that,
+with `pending_count=4`, all 4 queued ids and run 1's note as `last_note`. Run 2's `/done`
+got `idle`. `relay.out` logs only failed forwards, as status codes, never URLs or keys.
+
+For the job, have the bot wrap it instead:
+
+```sh
+NOTIFY_URL_FILE=$PWD/relay-event.url NOTIFY_KEY_FILE=$PWD/inbound.secret \
+  python3 /path/to/notify_on_exit.py --job demo --log $PWD/job.log -- sleep 60
+```
+
+When `sleep` exits, the bot gets a new wake with `kind: job_done`, `exit_code: 0` and the log path.
+
+**4. Clean up.** Stop the relay (`pkill -f relay.py`), delete the routine in Grok Bot (this
+retires its key), then `rm -rf ~/relay-test`.
+
+## 5. Limits, and what the platform should ship natively
 
 This is a workaround with known limits:
 - **It can't reach a live run.** The relay can't push events into a run that's already
