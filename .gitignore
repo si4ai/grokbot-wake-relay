@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+*.tmp
+relay-state.json
+.venv/
+# never commit secrets
+*.key
+*.secret
+*.url
