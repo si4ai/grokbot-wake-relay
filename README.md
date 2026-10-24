@@ -1,67 +1,130 @@
-# grokbot-shim
+# grokbot-wake-relay
 
-A small stdlib-only Python reference for webhook-woken bot routines. It shows the
-wake behavior we'd like the platform to provide natively, and it works as a
-stopgap until then.
+A stopgap for Grok Bot routines woken by webhooks. It's also a reference for how we'd
+like wakes to work natively. It uses only the Python 3.10+ standard library and is MIT licensed.
 
-## The problem
+## 1. The problem
 
-1. Every webhook POST starts its own cold run. A burst of 5 events gives 5 parallel runs
-   racing over the same work, replying twice and redoing each other's work.
-2. A run doesn't know what the previous run did.
-3. A background job started in a run finishes silently, and nothing wakes the bot to review it.
+We run a team of webhook-woken bots, and two things keep biting us:
 
-## The fix, as two pieces
+- **Bursts of events race.** Every webhook POST starts its own cold run. A burst of
+  5 events in 25 s starts 5 runs that race for the same work. That causes double
+  replies and stale answers, and no run knows what the last one did.
+- **Background jobs finish silently.** A job started in a run keeps going after the run
+  ends. When it finishes, nobody is told, and the result sits in a log no one reviews.
 
-**`relay.py`** sits between upstream senders and the bot's webhook, and holds a little
-state per routine (`active`, `pending`, `last_note`) in a JSON file.
-- Event while idle: forward it now as `{events, pending_count: 0, last_note, run_id}` and mark the routine active.
-- Event while active: queue it and return `202`.
-- `POST /done {note}` from the run: save the note. If anything is pending, send it all as
-  **one** batched wake. Otherwise go idle.
-- Lease timeout (default 15 min): if a run crashes without calling `/done`, the next event or tick un-wedges it.
-- Duplicate event `id`s are dropped, and forwards retry with exponential backoff and jitter.
-  After the last retry fails, the events go back to pending and the routine goes idle.
+Today every bot's prompt carries lock, retry and polling rules to paper over both problems.
 
-**`notify_on_exit.py`** runs a command detached. When it exits, it POSTs
-`{kind: "job_done", job, exit_code, log_path}` to the relay's `/event` or to the bot webhook.
-It sends only the exit code and log path, never log contents. A signal-killed job reports
-`128+N`, so SIGTERM gives `143`.
+## 2. What this repo does
 
-```sh
-notify_on_exit.py --job nightly-sweep --log /tmp/sweep.log -- ./sweep.sh
+- **`relay.py`** sits between event senders and the bot's webhook:
+  - **Idle routine:** the event is forwarded right away.
+  - **Active routine:** the event is queued, and the relay returns `202`.
+  - **Run calls `/done`:** the queued events go out as **one** wake that carries the
+    events, `pending_count` and the last run's note.
+  - **Safety rails:**
+    - a lease timeout un-wedges runs that crash without calling `/done`;
+    - duplicate event ids are dropped;
+    - forwards retry with backoff and jitter;
+    - state survives restarts.
+- **`notify_on_exit.py`** runs a job detached. When the job exits, it wakes the bot with
+  `{kind: "job_done", job, exit_code, log_path}`. It sends the exit code and log path,
+  never log contents. A job killed by SIGTERM reports `143`.
+
+```mermaid
+flowchart LR
+  subgraph Before
+    A[5 events] --> R1[run] & R2[run] & R3[run] & R4[run] & R5[run]
+  end
+  subgraph After
+    B[5 events] --> X[relay] --> S1["run 1: event 1"]
+    S1 -- "/done + note" --> X --> S2["run 2: events 2-5, pending_count 4"]
+  end
 ```
 
-## The routine's one extra step
-
-As the last step of every run, call `POST /done` with
-`{"note": "<what I did / what's next>", "run_id": "<from the wake>"}`. The next wake
-includes that note as `last_note`. A `/done` carrying a stale `run_id` gets `409`.
-
-## Config
-
-The relay reads its config from env vars. Secrets are always read from files and never printed:
-`RELAY_DOWNSTREAM_URL_FILE`, `RELAY_DOWNSTREAM_KEY_FILE`, optional `RELAY_INBOUND_SECRET_FILE`
-(callers send `Authorization: Bearer <secret>`), `RELAY_STATE`, `RELAY_LEASE_SECONDS`,
-`RELAY_TICK_SECONDS`, `RELAY_BIND` (default `127.0.0.1`) and `RELAY_PORT`.
-The wrapper uses `NOTIFY_URL_FILE` and an optional `NOTIFY_KEY_FILE`.
-
-## Limits (why this should be native)
-
-- The relay **can't push events into a run that's already going**. It can only batch them
-  for the next run. A native fix could deliver them to the live run, or let the runner
-  hand over a pending count.
-- `last_note` is only as good as what the run writes. A native per-routine state slot
-  would be loaded automatically.
-- A run that crashes delays queued events until the lease expires.
-- One relay process serves one routine. A SIGKILLed wrapper can't report, and nothing can catch SIGKILL.
-- It isn't hardened for the public internet. Run it behind TLS and your own auth.
-
-## Run
+## 3. Quick start
 
 ```sh
-python -m unittest discover -s tests -v   # 16 tests, about 12 s
 python demo.py                            # localhost-only end-to-end demo
+python -m unittest discover -s tests -v   # 16 tests, about 12 s
+
+# real use: secrets live in files (chmod 600), never inline
+export RELAY_DOWNSTREAM_URL_FILE=./bot-webhook.url
+export RELAY_DOWNSTREAM_KEY_FILE=./bot-webhook.key
+export RELAY_INBOUND_SECRET_FILE=./relay-inbound.secret
+python relay.py                           # listens on 127.0.0.1:8787
+
+# wrap a long job so the bot hears when it ends
+NOTIFY_URL_FILE=./relay-event.url NOTIFY_KEY_FILE=./relay-inbound.secret \
+  python notify_on_exit.py --job nightly --log ./nightly.log -- ./nightly.sh
 ```
 
-MIT licensed.
+Point your event senders at the relay's `/event` and send `Authorization: Bearer <secret>`.
+
+### The routine's one extra step
+
+Every wake includes `events`, `pending_count`, `last_note` and `run_id`. As the run's last step, it calls:
+
+```
+POST /done   {"note": "what I did / what's next", "run_id": "<from the wake>"}
+```
+
+The next wake receives that note as `last_note`. A `/done` from an old run gets `409`.
+
+### Config (env vars)
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `RELAY_DOWNSTREAM_URL_FILE` | file containing the bot webhook URL | required |
+| `RELAY_DOWNSTREAM_KEY_FILE` | file containing the bot webhook bearer key | required |
+| `RELAY_INBOUND_SECRET_FILE` | file containing the secret callers must send | off |
+| `RELAY_STATE` | state file path | `relay-state.json` |
+| `RELAY_LEASE_SECONDS` | how long until a run without `/done` is treated as dead | `900` |
+| `RELAY_TICK_SECONDS` | how often the lease is checked | `30` |
+| `RELAY_BIND` / `RELAY_PORT` | listen address | `127.0.0.1` / `8787` |
+| `RELAY_RETRIES` / `RELAY_BACKOFF` | forward retries and base delay (s) | `5` / `1.0` |
+| `NOTIFY_URL_FILE` / `NOTIFY_KEY_FILE` | wrapper target (relay `/event` or bot webhook) and key | required / off |
+
+URLs and keys are only ever read from files. They're never logged or printed.
+
+### Demo output
+
+```
+t= 0.0s POST /event evt-0 -> 200 {'status': 'forwarded'}
+t= 0.4s POST /event evt-1 -> 202 {'status': 'queued', 'pending': 1}
+t= 0.8s POST /event evt-2 -> 202 {'status': 'queued', 'pending': 2}
+t= 1.2s POST /event evt-3 -> 202 {'status': 'queued', 'pending': 3}
+t= 1.6s POST /event evt-4 -> 202 {'status': 'queued', 'pending': 4}
+run 1 finishes and calls /done -> (200, {'status': 'forwarded batch', 'count': 4})
+run 2 finishes and calls /done -> (200, {'status': 'idle'})
+
+fake bot saw 2 forwards (5 events):
+  wake 1: events=['evt-0'] pending_count=0 last_note=null
+  wake 2: events=['evt-1', 'evt-2', 'evt-3', 'evt-4'] pending_count=4 last_note="handled evt-0"
+```
+
+Five events became two wakes instead of five racing runs.
+
+## 4. Limits, and what the platform should ship natively
+
+This is a workaround with known limits:
+- **It can't reach a live run.** It can't push events into a run that's already going;
+  it can only batch them for the next run.
+- **The routine has to cooperate.** It must call `/done`. If a run crashes, queued
+  events wait for the lease to expire.
+- **The note is manual.** `last_note` is only as good as what the run writes.
+- **Hard kills go unreported.** A SIGKILLed job can't report its exit.
+- **It isn't hardened for the internet.** It's one process per routine, bound to
+  localhost by default. Put TLS and auth in front of it if you expose it.
+
+What we'd like the platform to ship instead:
+
+1. **Coalesce or queue events into the active run.** Deliver new events to the live run,
+   or hold them for one follow-up run with a pending count. Never run a routine twice at once.
+2. **A small pinned per-routine state.** One run writes it, and the next run starts with it
+   loaded. Keep it separate from long-term memory.
+3. **A completion wake for jobs the bot started.** Wake the bot with the exit code and output
+   path: a new turn if it's idle, or queued into the current turn if it's busy. Waking on
+   matched output lines should be opt-in and rate-capped.
+
+Once those ship, this repo can be deleted.
