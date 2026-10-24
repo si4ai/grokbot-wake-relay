@@ -4,6 +4,12 @@ A Grok Bot routine is a saved prompt that runs when a webhook or schedule fires.
 is a stopgap for routines woken by webhooks, and a reference for how we'd like wakes to
 work natively. It uses only the Python 3.10+ standard library and is MIT licensed.
 
+The webhook storm is worked around today: `relay.py` coalesces events into one run at a
+time and carries a handoff note. Proven live: 5 events gave 2 wakes, and the second wake
+carried run 1's note. The completion signal is not something we can work around.
+`notify_on_exit.py` plus the relay can wake an idle bot, but a busy run never gets the
+signal; that needs the platform.
+
 ## 1. The problem
 
 We run a team of webhook-woken bots, and two things keep biting us:
@@ -18,8 +24,12 @@ We run a team of webhook-woken bots, and two things keep biting us:
   run started at the following slot.
 - **Background jobs finish silently.** A job started in a run keeps going after the run
   ends. When it finishes, nobody is told, and the result sits in a log no one reviews.
+  Waking an idle bot afterwards can be scripted. Delivering that signal into a busy run
+  cannot; that needs the platform.
 
-Today every bot's prompt carries lock, retry and polling rules to paper over both problems.
+Prompt-side lock, retry and polling rules used to paper over both gaps. The webhook storm
+is worked around today: `relay.py` coalesces events into one run at a time and carries a
+handoff note. The completion signal is not something we can work around.
 
 ### Today: burst of webhooks
 
@@ -41,8 +51,9 @@ sequenceDiagram
 
 ## 2. What this repo does
 
-**`notify_on_exit.py`** is the more broadly useful piece. It runs a job detached, and when
-the job exits it wakes the bot with `{kind: "job_done", job, exit_code, log_path}`. It sends
+**`notify_on_exit.py`** runs a job detached, and when the job exits it posts
+`{kind: "job_done", job, exit_code, log_path}`. With the relay, that wakes an idle bot.
+A busy run never gets the signal; that needs the platform. It sends
 the exit code and log path, never log contents, and a job killed by SIGTERM reports `143`.
 It retries 5xx and network errors with backoff and jitter, and does not retry other 4xx,
 with one exception: the platform answers a run-rate-limit rejection with an HTTP `400` whose
@@ -268,7 +279,11 @@ retires its key), then `rm -rf ~/relay-test`.
 
 ## 5. Limits, and what the platform should ship natively
 
-This is a workaround with known limits:
+The webhook storm is worked around today: `relay.py` coalesces events into one run at a
+time and carries a handoff note. Proven live: 5 events gave 2 wakes, and the second wake
+carried run 1's note. The completion signal is not something we can work around.
+`notify_on_exit.py` plus the relay can wake an idle bot, but a busy run never gets the
+signal; that needs the platform. Known limits of what this repo can do:
 - **It can't reach a live run.** The relay can't push events into a run that's already
   going; it can only batch them for the next run.
 - **The routine has to cooperate.** It must call `/done`. If a run crashes, queued events
@@ -281,13 +296,15 @@ This is a workaround with known limits:
 
 What we'd like the platform to ship instead:
 
-1. **Coalesce webhook events the way schedules already work.** Scheduled runs take turns, but
+1. **Coalescing** (fully worked around by this repo, though native is still better).
+   Coalesce webhook events the way schedules already work. Scheduled runs take turns, but
    webhook runs overlap: 5 POSTs gave 5 runs at once. Never run a routine twice at once;
    deliver new events into the active run or one follow-up run with a pending count.
-2. **A small pinned per-routine state.** One run writes it, and the next run starts with it
-   loaded. Keep it separate from long-term memory.
-3. **A completion wake for jobs the bot started.** Wake the bot with the exit code and output
-   path: a new turn if it's idle, or queued into the current turn if it's busy. Waking on
-   matched output lines should be opt-in and rate-capped.
+2. **Pinned state** (worked around via the relay's handoff note). A small pinned
+   per-routine state. One run writes it, and the next run starts with it loaded. Keep it
+   separate from long-term memory.
+3. **Completion signal** (only the idle wake can be worked around; delivery into a busy
+   run needs native support). An opt-in completion signal for jobs the bot itself started:
+   wake it if idle, deliver it into the current run if busy, rate-capped.
 
 Once those ship, this repo can be deleted.
