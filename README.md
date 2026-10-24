@@ -15,6 +15,27 @@ We run a team of webhook-woken bots, and two things keep biting us:
 
 Today every bot's prompt carries lock, retry and polling rules to paper over both problems.
 
+### Today: burst of webhooks
+
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant P as Platform
+    participant R1 as Run 1
+    participant R5 as Runs 2-5
+    participant W as Shared work
+    S->>P: 5 events in 25 s
+    par 5 parallel runs
+        P->>R1: start (cold)
+    and
+        P->>R5: start x4 (cold)
+    end
+    R1->>W: read queue, reply
+    R5->>W: read same queue, reply
+    Note over W: double reply, stale answers
+```
+
+
 ## 2. What this repo does
 
 - **`relay.py`** sits between event senders and the bot's webhook:
@@ -31,15 +52,37 @@ Today every bot's prompt carries lock, retry and polling rules to paper over bot
   `{kind: "job_done", job, exit_code, log_path}`. It sends the exit code and log path,
   never log contents. A job killed by SIGTERM reports `143`.
 
+### With the relay
+
 ```mermaid
-flowchart LR
-  subgraph Before
-    A[5 events] --> R1[run] & R2[run] & R3[run] & R4[run] & R5[run]
-  end
-  subgraph After
-    B[5 events] --> X[relay] --> S1["run 1: event 1"]
-    S1 -- "/done + note" --> X --> S2["run 2: events 2-5, pending_count 4"]
-  end
+sequenceDiagram
+    participant S as Sender
+    participant R as Relay
+    participant B as Bot
+    S->>R: event 1
+    R->>B: wake [event 1], pending_count=0
+    Note over B: Run 1 starts
+    S->>R: events 2-5
+    R-->>S: 202 queued
+    B->>R: /done (note)
+    R->>B: wake [events 2-5], pending_count=4, last_note
+    Note over B: Run 2 starts
+```
+
+### Completion wake
+
+```mermaid
+sequenceDiagram
+    participant B as Bot run
+    participant W as notify_on_exit
+    participant J as Job
+    participant T as Relay or bot webhook
+    B->>W: start job (detached)
+    W->>J: run command
+    Note over B: run ends
+    J-->>W: exits later
+    W->>T: POST job_done, exit_code, log_path
+    T->>B: wake bot
 ```
 
 ## 3. Quick start
