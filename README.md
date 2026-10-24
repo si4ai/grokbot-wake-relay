@@ -14,7 +14,8 @@ We run a team of webhook-woken bots, and two things keep biting us:
   may see long-term memory, but there is no guaranteed handoff).
   Each repeats the same work, which leads to double replies and stale answers. Scheduled
   runs behave differently: they take turns. A 7-minute run on a 5-minute schedule never
-  overlapped; the next run waited for the first to end.
+  overlapped; the schedule slot that fell inside the running run was skipped, and the next
+  run started at the following slot.
 - **Background jobs finish silently.** A job started in a run keeps going after the run
   ends. When it finishes, nobody is told, and the result sits in a log no one reviews.
 
@@ -69,9 +70,10 @@ It also has these safeguards:
 
 **Restart during a live run.** The relay can't tell whether a run it was tracking is still
 alive, so a restart goes idle. The next event starts a second run, which may overlap the
-old one. The old run's `/done` is still accepted once, for its note only: it gets `200`, its
-note becomes `last_note` for the next wake, and the new run is untouched. Any later `/done`
-from it gets `409`.
+old one. The old run's `/done` is still accepted once, for its note only, and only when it
+carries a note: it gets `200`, its note becomes `last_note` for the next wake unless the new
+run's `/done` brings its own note, and the new run is untouched. A noteless orphan `/done`
+gets `409`, and so does any later `/done` from the old run.
 
 ### With the relay
 
@@ -227,8 +229,9 @@ They run at the same time. In our test, POSTs at 1 s intervals gave 5 runs that 
 within 5 s and all finished 60-80 s later, so all 5 were busy at once. Their `/done` calls
 fail, because no relay is running yet. (A schedule behaves differently: its runs take turns.)
 
-For the silent job, ask the bot in a run to start `(sleep 120; echo finished > ~/relay-test/job.txt) &`
-and end its turn. `job.txt` appears two minutes later, and nobody is woken.
+For the silent job, ask the bot in a run to start
+`setsid nohup sh -c 'sleep 120; echo finished > ~/relay-test/job.txt' >/dev/null 2>&1 &`
+and end its turn (we only showed a `setsid` job outliving the end of its run). `job.txt` appears two minutes later, and nobody is woken.
 
 **3. Apply the fix.** Start the relay, then send the same burst to it instead:
 
