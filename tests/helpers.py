@@ -6,10 +6,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class FakeBot:
-    """Fake downstream bot webhook on localhost that records every POST."""
+    """Fake downstream bot webhook on localhost that records every accepted POST.
 
-    def __init__(self, fail_first=0):
-        self.received, self.auth, self.fail_left = [], [], fail_first
+    script: status codes to answer first (then 200). A 3xx redirects to `redirect_to`.
+    """
+
+    def __init__(self, fail_first=0, script=None, redirect_to=None):
+        self.received, self.auth, self.hits = [], [], 0
+        self.script = list(script or []) + [503] * fail_first
         bot = self
 
         class H(BaseHTTPRequestHandler):
@@ -18,13 +22,14 @@ class FakeBot:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                if bot.fail_left > 0:
-                    bot.fail_left -= 1
-                    self.send_response(503)
-                else:
+                bot.hits += 1
+                code = bot.script.pop(0) if bot.script else 200
+                if code == 200:
                     bot.received.append(body)
                     bot.auth.append(self.headers.get("Authorization"))
-                    self.send_response(200)
+                self.send_response(code)
+                if 300 <= code < 400:
+                    self.send_header("Location", redirect_to)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 

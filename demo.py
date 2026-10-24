@@ -21,10 +21,10 @@ def main():
             code, body = post(base + "/event", {"id": f"evt-{i}", "text": f"event {i}"})
             print(f"t={time.time() - t0:4.1f}s POST /event evt-{i} -> {code} {body}")
             time.sleep(0.4)
-        bot.wait_for(1)
-        print("run 1 finishes and calls /done ->", post(base + "/done", {"note": "handled evt-0"}))
-        bot.wait_for(2)
-        print("run 2 finishes and calls /done ->", post(base + "/done", {"note": "handled evt-1..4"}))
+        for n, note in ((1, "handled evt-0"), (2, "handled evt-1..4")):
+            bot.wait_for(n)
+            body = {"note": note, "run_id": bot.received[n - 1]["run_id"]}
+            print(f"run {n} finishes and calls /done ->", post(base + "/done", body))
         print(f"\nfake bot saw {len(bot.received)} forwards (5 events):")
         for i, f in enumerate(bot.received, 1):
             ids = [e["id"] for e in f["events"]]

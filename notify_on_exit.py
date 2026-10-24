@@ -8,8 +8,17 @@ A signal-killed command reports 128+signum (TERM -> 143), including when the
 wrapper itself gets SIGTERM/SIGINT/SIGHUP (it forwards the signal, then reports).
 Target (env): NOTIFY_URL_FILE (file holding the relay /event URL or a bot webhook URL)
 and optional NOTIFY_KEY_FILE (bearer key). Neither value is ever printed.
+Gaps: POSIX only; if the wrapper itself is SIGKILLed, nothing is sent.
 """
-import argparse, json, os, random, signal, subprocess, sys, time, urllib.request, uuid
+import argparse, json, os, random, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None                    # 3xx is a failure: never resend the key
+
+
+OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def _read(path):
@@ -30,9 +39,13 @@ def notify(payload, retries=4, backoff=1.0):
         try:
             req = urllib.request.Request(_read(url_file), data=data, headers=headers,
                                          method="POST")
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with OPENER.open(req, timeout=10) as r:
                 if 200 <= r.status < 300:
                     return True
+        except urllib.error.HTTPError as e:
+            print(f"notify_on_exit: attempt {attempt + 1} got status {e.code}", file=sys.stderr)
+            if 400 <= e.code < 500:    # our request is wrong; retrying won't help
+                return False
         except Exception as e:
             print(f"notify_on_exit: attempt {attempt + 1} failed ({type(e).__name__})",
                   file=sys.stderr)
@@ -41,17 +54,24 @@ def notify(payload, retries=4, backoff=1.0):
 
 
 def run(job, log_path, cmd):
-    with open(log_path, "ab") as log:
-        child = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
+    child, early = None, []
 
     def forward(signum, _frame):
+        if child is None:              # signal arrived before the child existed
+            early.append(signum)
+            return
         try:
             os.killpg(child.pid, signum)
         except ProcessLookupError:
             pass
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(s, forward)
+        signal.signal(s, forward)      # installed before the child starts
+
+    with open(log_path, "ab") as log:
+        child = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+    for signum in early:
+        forward(signum, None)
 
     rc = child.wait()
     if rc < 0:                     # killed by a signal: shell convention 128+N

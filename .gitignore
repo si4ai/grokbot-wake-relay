@@ -1,9 +1,13 @@
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.venv/
 *.log
 *.tmp
+# relay state can hold full event bodies: never commit it
 relay-state.json
-.venv/
+*.state.json
+state.json
 # never commit secrets
 *.key
 *.secret

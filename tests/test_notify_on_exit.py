@@ -53,6 +53,30 @@ class NotifyTest(unittest.TestCase):
         self.assertEqual(self.finish(p), 143)
         self.check(143)
 
+    def test_4xx_not_retried(self):
+        self.bot.close()
+        self.bot = FakeBot(script=[400] * 5)
+        write(self.tmp.name, "url", self.bot.url)
+        self.assertEqual(self.finish(self.start("exit 0")), 0)
+        self.assertEqual((self.bot.hits, self.bot.received), (1, []))
+
+    def test_5xx_retried(self):
+        self.bot.close()
+        self.bot = FakeBot(fail_first=2)
+        write(self.tmp.name, "url", self.bot.url)
+        self.assertEqual(self.finish(self.start("exit 0")), 0)
+        self.check(0)
+        self.assertEqual(self.bot.hits, 3)
+
+    def test_redirect_not_followed(self):
+        target = FakeBot()
+        self.bot.close()
+        self.bot = FakeBot(script=[302] * 5, redirect_to=target.url)
+        write(self.tmp.name, "url", self.bot.url)
+        self.assertEqual(self.finish(self.start("exit 0")), 0)
+        self.assertEqual((self.bot.hits, target.hits), (4, 0))
+        target.close()
+
     def test_detached_mode_returns_immediately(self):
         t = time.time()
         p = self.start("sleep 0.5; exit 7", fg=False)
