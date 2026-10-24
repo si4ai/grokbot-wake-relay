@@ -279,11 +279,8 @@ retires its key), then `rm -rf ~/relay-test`.
 
 ## 5. Limits, and what the platform should ship natively
 
-The webhook storm is worked around today: `relay.py` coalesces events into one run at a
-time and carries a handoff note. Proven live: 5 events gave 2 wakes, and the second wake
-carried run 1's note. The completion signal is not something we can work around.
-`notify_on_exit.py` plus the relay can wake an idle bot, but a busy run never gets the
-signal; that needs the platform. Known limits of what this repo can do:
+As the summary at the top says, the storm is worked around and the completion signal is
+not. Known limits of what this repo can do:
 - **It can't reach a live run.** The relay can't push events into a run that's already
   going; it can only batch them for the next run.
 - **The routine has to cooperate.** It must call `/done`. If a run crashes, queued events
@@ -296,7 +293,8 @@ signal; that needs the platform. Known limits of what this repo can do:
 
 What we'd like the platform to ship instead:
 
-1. **Coalescing** (fully worked around by this repo, though native is still better).
+1. **Coalescing** (worked around, but it needs an extra process per routine and a
+   cooperating `/done` call).
    Coalesce webhook events the way schedules already work. Scheduled runs take turns, but
    webhook runs overlap: 5 POSTs gave 5 runs at once. Never run a routine twice at once;
    deliver new events into the active run or one follow-up run with a pending count.
