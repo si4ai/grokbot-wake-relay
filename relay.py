@@ -10,7 +10,7 @@ Config (env): RELAY_STATE, RELAY_DOWNSTREAM_URL_FILE, RELAY_DOWNSTREAM_KEY_FILE,
 RELAY_INBOUND_SECRET_FILE, RELAY_LEASE_SECONDS (900), RELAY_TICK_SECONDS (30),
 RELAY_BIND (127.0.0.1), RELAY_PORT (8787), RELAY_RETRIES (5), RELAY_BACKOFF (1.0).
 """
-import hmac, ipaddress, json, os, random, threading, time, urllib.error, urllib.request, uuid
+import hmac, ipaddress, json, os, random, socket, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SEEN_MAX = 1000
@@ -44,11 +44,17 @@ class Relay:
         self.lease, self.retries, self.backoff, self.timeout = lease, retries, backoff, timeout
         self.lock = threading.Lock()
         self.st = {"active": False, "since": None, "run_id": None,
-                   "pending": [], "last_note": None, "seen": []}
+                   "pending": [], "last_note": None, "seen": [], "inflight": None,
+                   "orphan_run_id": None}
         if os.path.exists(state_path):
             with open(state_path) as f:
                 self.st.update(json.load(f))
+            if self.st["inflight"]:    # killed mid-forward: delivery unknown, so re-send
+                self.st["pending"] = self.st["inflight"]["events"] + self.st["pending"]
+                self.st["inflight"] = None
+                self._save()
             if self.st["active"]:      # the run we were tracking is unknowable now
+                self.st["orphan_run_id"] = self.st["run_id"]   # keep its /done note
                 self._idle()
 
     # -- state -------------------------------------------------------------
@@ -59,19 +65,24 @@ class Relay:
         os.replace(tmp, self.state_path)
 
     def _idle(self):
-        self.st.update(active=False, since=None, run_id=None)
+        self.st.update(active=False, since=None, run_id=None, inflight=None)
         self._save()
 
     def _expired(self):
         return self.st["active"] and time.time() - (self.st["since"] or 0) > self.lease
 
     def _start_run(self, events, pending_count):
-        """Caller holds the lock. Marks active and dispatches one wake."""
+        """Caller holds the lock. Marks active, persists the batch, dispatches one wake.
+
+        The batch stays in state["inflight"] until the bot answers 2xx (or the run's
+        /done arrives), so a crash mid-forward re-sends it on restart: at-least-once.
+        """
         run_id = uuid.uuid4().hex[:12]
-        self.st.update(active=True, since=time.time(), run_id=run_id, pending=[])
-        self._save()
         body = {"events": events, "pending_count": pending_count,
                 "last_note": self.st["last_note"], "run_id": run_id}
+        self.st.update(active=True, since=time.time(), run_id=run_id, pending=[],
+                       inflight=body)
+        self._save()
         threading.Thread(target=self._forward, args=(body,), daemon=True).start()
 
     # -- operations ----------------------------------------------------------
@@ -98,7 +109,13 @@ class Relay:
             return 400, {"error": "run_id required"}
         with self.lock:
             if rid != self.st["run_id"]:
+                if rid == self.st["orphan_run_id"] and "note" in body:
+                    # run from before a relay restart: keep its note for the next wake
+                    self.st.update(last_note=body["note"], orphan_run_id=None)
+                    self._save()
+                    return 200, {"status": "note kept (run predates restart)"}
                 return 409, {"status": "stale run_id"}
+            self.st["inflight"] = None         # the run exists, so its wake arrived
             if "note" in body:
                 self.st["last_note"] = body["note"]
             if self.st["pending"]:
@@ -126,6 +143,7 @@ class Relay:
                              "Authorization": "Bearer " + _read(self.key_file)})
                 with OPENER.open(req, timeout=self.timeout) as r:
                     if 200 <= r.status < 300:
+                        self._delivered(body["run_id"])
                         return True
                     err = f"status {r.status}"
             except urllib.error.HTTPError as e:  # never log URL or key
@@ -140,6 +158,13 @@ class Relay:
                 self._idle()
         return False
 
+    def _delivered(self, run_id):
+        with self.lock:
+            inf = self.st["inflight"]
+            if inf and inf["run_id"] == run_id:
+                self.st["inflight"] = None
+                self._save()
+
     def authorized(self, headers):
         if not self.secret:
             return True
@@ -152,6 +177,10 @@ def _loopback(host):
         return host == "localhost" or ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+class _Server6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
 
 
 def make_server(relay, bind="127.0.0.1", port=8787):
@@ -192,7 +221,7 @@ def make_server(relay, bind="127.0.0.1", port=8787):
                 return self._send(*relay.done(body if isinstance(body, dict) else {}))
             self._send(404, {"error": "not found"})
 
-    return ThreadingHTTPServer((bind, port), H)
+    return (_Server6 if ":" in bind else ThreadingHTTPServer)((bind, port), H)
 
 
 def main():

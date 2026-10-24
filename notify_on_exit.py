@@ -8,6 +8,9 @@ A signal-killed command reports 128+signum (TERM -> 143), including when the
 wrapper itself gets SIGTERM/SIGINT/SIGHUP (it forwards the signal, then reports).
 Target (env): NOTIFY_URL_FILE (file holding the relay /event URL or a bot webhook URL)
 and optional NOTIFY_KEY_FILE (bearer key). Neither value is ever printed.
+Retries: 5xx and network errors (NOTIFY_BACKOFF base, 4 tries). Other 4xx are not
+retried, except a 400 whose body says "rate limit": that is the platform's temporary
+run-rate rejection, retried over minutes (NOTIFY_RATE_BACKOFF base 15 s, 5 more tries).
 Gaps: POSIX only; if the wrapper itself is SIGKILLed, nothing is sent.
 """
 import argparse, json, os, random, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
@@ -26,7 +29,14 @@ def _read(path):
         return f.read().strip()
 
 
-def notify(payload, retries=4, backoff=1.0):
+def _rate_limited(err):
+    try:
+        return err.code == 400 and b"rate limit" in err.read(4096).lower()
+    except Exception:
+        return False
+
+
+def notify(payload, retries=4, backoff=1.0, rate_retries=5, rate_backoff=15.0):
     url_file = os.environ.get("NOTIFY_URL_FILE")
     if not url_file:
         print("notify_on_exit: NOTIFY_URL_FILE not set; not notifying", file=sys.stderr)
@@ -35,7 +45,8 @@ def notify(payload, retries=4, backoff=1.0):
     if os.environ.get("NOTIFY_KEY_FILE"):
         headers["Authorization"] = "Bearer " + _read(os.environ["NOTIFY_KEY_FILE"])
     data = json.dumps(payload).encode()
-    for attempt in range(retries):
+    attempt = rate_tries = 0
+    while attempt < retries:
         try:
             req = urllib.request.Request(_read(url_file), data=data, headers=headers,
                                          method="POST")
@@ -44,12 +55,17 @@ def notify(payload, retries=4, backoff=1.0):
                     return True
         except urllib.error.HTTPError as e:
             print(f"notify_on_exit: attempt {attempt + 1} got status {e.code}", file=sys.stderr)
+            if _rate_limited(e) and rate_tries < rate_retries:
+                time.sleep(rate_backoff * 2 ** rate_tries * random.uniform(0.5, 1.5))
+                rate_tries += 1        # temporary: does not use up the normal budget
+                continue
             if 400 <= e.code < 500:    # our request is wrong; retrying won't help
                 return False
         except Exception as e:
             print(f"notify_on_exit: attempt {attempt + 1} failed ({type(e).__name__})",
                   file=sys.stderr)
         time.sleep(backoff * 2 ** attempt * random.uniform(0.5, 1.5))
+        attempt += 1
     return False
 
 
@@ -78,7 +94,8 @@ def run(job, log_path, cmd):
         rc = 128 - rc
     payload = {"kind": "job_done", "id": f"job-{job}-{uuid.uuid4().hex[:12]}",
                "job": job, "exit_code": rc, "log_path": os.path.abspath(log_path)}
-    notify(payload, backoff=float(os.environ.get("NOTIFY_BACKOFF", 1.0)))
+    notify(payload, backoff=float(os.environ.get("NOTIFY_BACKOFF", 1.0)),
+           rate_backoff=float(os.environ.get("NOTIFY_RATE_BACKOFF", 15.0)))
     return rc
 
 

@@ -8,10 +8,13 @@ work natively. It uses only the Python 3.10+ standard library and is MIT license
 
 We run a team of webhook-woken bots, and two things keep biting us:
 
-- **Each POST starts its own cold run.** A burst of 5 events in 25 s gives 5 runs. None of
-  them knows what the last one did, so each repeats the same work, and that leads to
-  double replies and stale answers. Scheduled runs appear serialized: a 7-minute run on
-  a 5-minute schedule never overlapped. Whether webhook runs actually overlap is unconfirmed.
+- **Each POST starts its own cold run, and those runs overlap.** We sent 5 POSTs about 1 s
+  apart to a test routine. All 5 runs started within 5 s of each other, each busy for about
+  60 s, so all 5 were running at once. Nothing hands one run's state to the next (a run
+  may see long-term memory, but there is no guaranteed handoff).
+  Each repeats the same work, which leads to double replies and stale answers. Scheduled
+  runs behave differently: they take turns. A 7-minute run on a 5-minute schedule never
+  overlapped; the next run waited for the first to end.
 - **Background jobs finish silently.** A job started in a run keeps going after the run
   ends. When it finishes, nobody is told, and the result sits in a log no one reviews.
 
@@ -25,12 +28,14 @@ sequenceDiagram
     participant P as Platform
     participant R as Run
     participant W as Shared work
-    S->>P: 5 POSTs in 25 s
-    loop each POST
-        P->>R: start cold run (no memory of last)
-        R->>W: redo same work, reply
+    S->>P: 5 POSTs, ~1 s apart
+    par one cold run per POST
+        P->>R: run 1 (no handoff)
+    and
+        P->>R: runs 2-5 start within 5 s, no handoff
     end
-    Note over P,W: may overlap: double replies, stale answers
+    R->>W: 5 overlapping runs redo the same work, reply
+    Note over P,W: measured: all 5 busy at once, none sees the others (scheduled runs take turns)
 ```
 
 ## 2. What this repo does
@@ -38,9 +43,13 @@ sequenceDiagram
 **`notify_on_exit.py`** is the more broadly useful piece. It runs a job detached, and when
 the job exits it wakes the bot with `{kind: "job_done", job, exit_code, log_path}`. It sends
 the exit code and log path, never log contents, and a job killed by SIGTERM reports `143`.
-It's POSIX only. If the wrapper itself is SIGKILLed, nothing is sent.
+It retries 5xx and network errors with backoff and jitter, and does not retry other 4xx,
+with one exception: the platform answers a run-rate-limit rejection with an HTTP `400` whose
+body says "rate limit", and that one is temporary, so the wrapper retries it over several
+minutes (5 more tries from a 15 s base). It's POSIX only. If the wrapper itself is SIGKILLed,
+nothing is sent.
 
-**`relay.py`** is a prototype. You only need it if your webhook runs overlap, or if you want
+**`relay.py`** is a prototype. Use it if overlapping webhook runs hurt you, or if you want
 batching plus a handoff note today. It sits between event senders and the bot's webhook:
 - **Idle routine:** the event is forwarded right away.
 - **Active routine:** the event is queued, and the relay returns `202`.
@@ -52,7 +61,17 @@ It also has these safeguards:
 - duplicate event ids are dropped;
 - forwards retry with backoff and jitter but never follow redirects;
 - events stranded by failed forwards are re-sent on the next tick;
-- a restart resets the routine to idle and re-sends anything pending.
+- a restart resets the routine to idle and re-sends anything pending;
+- a batch is saved before it is forwarded, so a crash mid-forward re-sends it after a restart.
+  Delivery is at-least-once: a crash just after the bot accepted a wake can repeat it;
+- forwards to the bot retry any failure, including the platform's rate-limit `400`; if the
+  retries run out, the events wait and the next tick (every 30 s) tries again.
+
+**Restart during a live run.** The relay can't tell whether a run it was tracking is still
+alive, so a restart goes idle. The next event starts a second run, which may overlap the
+old one. The old run's `/done` is still accepted once, for its note only: it gets `200`, its
+note becomes `last_note` for the next wake, and the new run is untouched. Any later `/done`
+from it gets `409`.
 
 ### With the relay
 
@@ -138,12 +157,13 @@ gets `400`, and one from an old run gets `409`.
 | `RELAY_STATE` | state file path | `relay-state.json` |
 | `RELAY_LEASE_SECONDS` | how long until a run without `/done` is treated as dead | `900` |
 | `RELAY_TICK_SECONDS` | how often the lease and stranded events are checked | `30` |
-| `RELAY_BIND` / `RELAY_PORT` | listen address | `127.0.0.1` / `8787` |
+| `RELAY_BIND` / `RELAY_PORT` | listen address (IPv4 or IPv6, e.g. `::1`) | `127.0.0.1` / `8787` |
 | `RELAY_RETRIES` / `RELAY_BACKOFF` | forward retries and base delay (s); total must fit in the lease | `5` / `1.0` |
 | `NOTIFY_URL_FILE` / `NOTIFY_KEY_FILE` | wrapper target and key | required / off |
+| `NOTIFY_BACKOFF` / `NOTIFY_RATE_BACKOFF` | wrapper base delay (s) for errors / for rate-limit `400`s | `1.0` / `15` |
 
 The relay won't start in an unsafe or inconsistent setup:
-- It refuses a non-loopback bind without an inbound secret.
+- It refuses a non-loopback bind (loopback means `127.0.0.0/8`, `localhost` or `::1`) without an inbound secret.
 - It rejects request bodies over 64 KB with `413`.
 - It won't start if its retry budget is longer than the lease.
 
@@ -203,8 +223,9 @@ done
 ```
 
 You get 5 separate cold runs and 5 `wake` lines, each with no idea the others happened.
-Their `/done` calls fail, because no relay is running yet. Whether webhook runs overlap
-is unconfirmed; scheduled runs were seen to serialize.
+They run at the same time. In our test, POSTs at 1 s intervals gave 5 runs that all started
+within 5 s and all finished 60-80 s later, so all 5 were busy at once. Their `/done` calls
+fail, because no relay is running yet. (A schedule behaves differently: its runs take turns.)
 
 For the silent job, ask the bot in a run to start `(sleep 120; echo finished > ~/relay-test/job.txt) &`
 and end its turn. `job.txt` appears two minutes later, and nobody is woken.
@@ -225,7 +246,8 @@ Expect `forwarded` and then 4 × `queued`. In our run against a live routine, 5 
 2 wakes. The first wake came 6 s after the first event, with `pending_count=0`. About 70 s
 later, run 1's `/done` got `forwarded batch, count 4`. The second wake came 6 s after that,
 with `pending_count=4`, all 4 queued ids and run 1's note as `last_note`. Run 2's `/done`
-got `idle`. `relay.out` logs only failed forwards, as status codes, never URLs or keys.
+got `idle`. `relay.out` prints one `relay: listening on 127.0.0.1:8787` line at startup,
+then only failed forwards, as status codes, never URLs or keys.
 
 For the job, have the bot wrap it instead:
 
@@ -234,7 +256,9 @@ NOTIFY_URL_FILE=$PWD/relay-event.url NOTIFY_KEY_FILE=$PWD/inbound.secret \
   python3 /path/to/notify_on_exit.py --job demo --log $PWD/job.log -- sleep 60
 ```
 
-When `sleep` exits, the bot gets a new wake with `kind: job_done`, `exit_code: 0` and the log path.
+When `sleep` exits, the wrapper posts an event with `kind: job_done`, `exit_code: 0` and the
+log path. Through the relay it is one of the wake's `events`: a new wake if the routine is idle,
+or queued (`202`) for the next wake if a run is active.
 
 **4. Clean up.** Stop the relay (`pkill -f relay.py`), delete the routine in Grok Bot (this
 retires its key), then `rm -rf ~/relay-test`.
@@ -248,13 +272,15 @@ This is a workaround with known limits:
   wait for the lease to expire.
 - **The note is manual.** `last_note` is only as good as what the run writes.
 - **The wrapper has gaps.** It's POSIX only, and a SIGKILL sends nothing.
+- **A restart can let two runs overlap.** See "Restart during a live run" above.
 - **It isn't hardened for the internet.** It's one process per routine, bound to
   localhost by default. Put TLS in front of it if you expose it.
 
 What we'd like the platform to ship instead:
 
-1. **Coalesce webhook events like schedules.** Never run a routine twice at once; deliver
-   new events into the active run or one follow-up run with a pending count.
+1. **Coalesce webhook events the way schedules already work.** Scheduled runs take turns, but
+   webhook runs overlap: 5 POSTs gave 5 runs at once. Never run a routine twice at once;
+   deliver new events into the active run or one follow-up run with a pending count.
 2. **A small pinned per-routine state.** One run writes it, and the next run starts with it
    loaded. Keep it separate from long-term memory.
 3. **A completion wake for jobs the bot started.** Wake the bot with the exit code and output
